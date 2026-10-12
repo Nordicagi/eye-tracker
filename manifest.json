@@ -1,0 +1,8 @@
+{
+  "name": "Watching Eyes",
+  "short_name": "Eyes",
+  "start_url": ".",
+  "display": "fullscreen",
+  "background_color": "#050506",
+  "theme_color": "#050506"
+}

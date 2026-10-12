@@ -68,8 +68,12 @@
     font-size: 12px; letter-spacing: .04em;
     color: var(--text-dim);
     pointer-events: none;
+    transition: opacity .8s;
   }
+  #status.quiet { opacity: 0; }
+  body.running { cursor: none; }
 </style>
+<link rel="manifest" href="manifest.json">
 </head>
 <body>
 <canvas id="stage"></canvas>
@@ -78,6 +82,7 @@
 <div id="start">
   <button id="go" type="button">Start the eyes</button>
   <p>You will be asked to allow the camera. The picture stays on this device. Nothing is recorded or sent anywhere.</p>
+  <p id="hint"></p>
 </div>
 <div id="status" aria-live="polite"></div>
 
@@ -117,9 +122,33 @@ let lastFace = null;
 let detector = null;
 let W = 0, H = 0, DPR = 1;
 
+// Messages show for a few seconds, then fade so only the eyes are left.
+let statusTimer = 0;
 function setStatus(text) {
-  if (statusEl.textContent !== text) statusEl.textContent = text;
+  if (statusEl.textContent === text) return;
+  statusEl.textContent = text;
+  statusEl.classList.remove("quiet");
+  clearTimeout(statusTimer);
+  statusTimer = setTimeout(() => statusEl.classList.add("quiet"), 3500);
 }
+
+// Full screen. iPhone Safari only hides its bars for a page opened from the Home Screen.
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent);
+const canFullscreen = !!document.documentElement.requestFullscreen;
+document.getElementById("hint").textContent =
+  isIOS && !navigator.standalone ? "For full screen with no Safari bars: tap Share, then Add to Home Screen, and open it from the new icon."
+  : canFullscreen ? "Double-tap or double-click the eyes for full screen."
+  : "";
+function toggleFullscreen() {
+  if (!canFullscreen) return;
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  else document.documentElement.requestFullscreen().catch(() => {});
+}
+let lastTap = 0;
+canvas.addEventListener("pointerup", e => {
+  if (e.timeStamp - lastTap < 350) { toggleFullscreen(); lastTap = 0; }
+  else lastTap = e.timeStamp;
+});
 
 // ---------- Face tracking ----------
 
@@ -156,13 +185,72 @@ function detectRegion(x, y, s, minScore) {
     if (!b) continue;
     const score = d.categories && d.categories[0] ? d.categories[0].score : 1;
     if (score < minScore) continue;
-    out.push({
+    const face = {
       cx: x + (b.originX + b.width / 2) / WORK_WIDTH * s,
       cy: y + (b.originY + b.height / 2) / wh * s,
       size: b.height / wh * s,
-    });
+      yaw: 1, roll: 0,
+    };
+    // Landmarks: 0 and 1 are the eyes, 2 the nose tip, 4 and 5 the ears.
+    const p = d.keypoints;
+    if (p && p.length >= 6) {
+      const earGap = Math.abs(p[5].x - p[4].x);
+      // Nose centred between the ears means the head is turned toward the camera.
+      if (earGap > 0.001) face.yaw = (p[2].x - (p[4].x + p[5].x) / 2) / earGap;
+      face.roll = Math.atan2((p[1].y - p[0].y) * wh, (p[1].x - p[0].x) * WORK_WIDTH);
+    }
+    out.push(face);
   }
   return out;
+}
+
+// ---------- Reactions ----------
+
+// What the eyes do in response to the person they are watching.
+const react = {
+  facing: 0,        // 0 to 1, how sure it is that the person is looking back
+  facingSince: 0,
+  avertUntil: 0,    // caught staring: look away until this time
+  avertDir: 1,
+  avertReady: 0,
+  startle: 0,       // jumps to 1 when someone rushes closer, then fades
+  startleReady: 0,
+  stare: 0,         // builds while someone holds its gaze
+  sizeSlow: 0,
+  tilt: 0, tiltWanted: 0,
+  searchUntil: 0,   // just lost someone: hunt for them
+};
+
+function observe(face, sameTarget, now) {
+  if (!sameTarget) {
+    react.facing = 0;
+    react.facingSince = 0;
+    react.sizeSlow = face.size;
+  }
+  const wasFacing = react.facing > 0.6;
+  react.facing += ((Math.abs(face.yaw) < 0.18 ? 1 : 0) - react.facing) * 0.12;
+  const isFacing = react.facing > 0.6;
+
+  if (isFacing && !wasFacing) {
+    react.facingSince = now;
+    // They looked straight at it. Pretend it was not staring.
+    if (now > react.avertReady) {
+      react.avertUntil = now + rand(900, 1500);
+      react.avertDir = target.x > 0 ? -1 : 1;
+      react.avertReady = now + 6000;
+    }
+  }
+  if (!isFacing) react.facingSince = 0;
+
+  // Someone suddenly much closer than a moment ago.
+  if (face.size > react.sizeSlow * 1.35 && now > react.startleReady) {
+    react.startle = 1;
+    react.startleReady = now + 3000;
+  }
+  react.sizeSlow += (face.size - react.sizeSlow) * 0.04;
+
+  // Copy the tilt of their head.
+  react.tiltWanted = clamp(-face.roll * 0.7, -0.3, 0.3);
 }
 
 function scanTile(index, now) {
@@ -238,10 +326,12 @@ function detect(now) {
   scopeWanted = usingScope;
 
   if (!face) {
+    if (lastFace) react.searchUntil = now + 4000;
     lastFace = null;
     if (own) setStatus("Ignoring you. Looking for other people.");
     return;
   }
+  observe(face, !!lastFace && Math.hypot(face.cx - lastFace.cx, face.cy - lastFace.cy) < 0.15, now);
   lastFace = face;
   lastFaceAt = now;
   // The front camera sees you un-mirrored, so a face on the picture's left is on the screen's right.
@@ -285,6 +375,7 @@ document.addEventListener("visibilitychange", () => {
 
 document.getElementById("go").addEventListener("click", async () => {
   startPanel.hidden = true;
+  document.body.classList.add("running");
   keepAwake();
   if (!navigator.mediaDevices?.getUserMedia) {
     setStatus("No camera here. Open this page over https. The eyes follow your finger for now.");
@@ -399,7 +490,8 @@ function drawEye(cx, cy, r, side, closed, g, sprite) {
   const ix = cx + ox, iy = cy + oy;
   // A small iris with white showing all round is what makes a stare unsettling.
   const irisR = r * 0.4;
-  const pupilR = irisR * (0.26 + gaze.near * 0.4);
+  // Pupils shrink to pinpoints on a fright and swell during a stare-down.
+  const pupilR = irisR * clamp(0.26 + gaze.near * 0.4 + react.stare * 0.35 - react.startle * 0.2, 0.12, 0.82);
 
   ctx.save();
   circle(cx, cy, r);
@@ -507,14 +599,21 @@ function draw(now) {
   ctx.fillRect(0, 0, W, H);
 
   // Sized so the eyes and the binoculars fit both upright and sideways.
-  const r = Math.min(W * 0.19, H * 0.3);
-  const spread = Math.max(W * 0.25, r * 1.15);
-  if (r !== spriteR) { sprites = [buildSprite(r, 7), buildSprite(r, 91)]; spriteR = r; }
+  const base = Math.min(W * 0.19, H * 0.3);
+  const spread = Math.max(W * 0.25, base * 1.15);
+  if (base !== spriteR) { sprites = [buildSprite(base, 7), buildSprite(base, 91)]; spriteR = base; }
   const closed = blinkAmount(now);
+  // Eyes bulge on a fright and during a stare-down.
+  const r = base * (1 + 0.16 * react.startle + 0.1 * react.stare);
 
+  ctx.save();
+  ctx.translate(W / 2, H / 2);
+  ctx.rotate(react.tilt);
+  ctx.translate(-W / 2, -H / 2);
   drawEye(W / 2 - spread, H / 2, r, -1, closed, gaze, sprites[0]);
   drawEye(W / 2 + spread, H / 2, r, 1, closed, gazeB, sprites[1]);
-  if (scope > 0.01) drawBinoculars(W / 2, H / 2, r, spread, scope);
+  if (scope > 0.01) drawBinoculars(W / 2, H / 2, base, spread, scope);
+  ctx.restore();
 }
 
 // ---------- Animation ----------
@@ -528,23 +627,38 @@ function update(now, dt) {
     target.x = rand(-0.8, 0.8);
     target.y = rand(-0.4, 0.4);
     target.near = 0.2;
-    idle.next = now + rand(1200, 3800);
+    // Right after losing someone it hunts about quickly, then settles.
+    idle.next = now + (now < react.searchUntil ? rand(250, 650) : rand(1200, 3800));
     if (detector && sinceFace > 3000 && !owner) setStatus("Looking for people");
   }
 
-  // Tiny darts keep a held stare from looking frozen.
+  const watching = sinceFace < 600;
+  const held = watching && react.facingSince && now > react.avertUntil ? now - react.facingSince : 0;
+  react.stare += ((held > 3500 ? 1 : 0) - react.stare) * (1 - Math.exp(-dt * 1.5));
+  react.startle *= Math.exp(-dt * 2.2);
+  if (!watching) react.tiltWanted = 0;
+  react.tilt += (react.tiltWanted - react.tilt) * (1 - Math.exp(-dt * 5));
+
+  // Tiny darts keep a held stare from looking frozen. In a stare-down they become a tremble.
   if (now > jitter.next) {
     jitter.x = rand(-0.03, 0.03);
     jitter.y = rand(-0.02, 0.02);
-    jitter.next = now + rand(350, 1600);
+    jitter.next = now + (react.stare > 0.5 ? rand(40, 110) : rand(350, 1600));
+  }
+
+  // Caught staring: glance off to the side and down until the coast is clear.
+  let tx = target.x + jitter.x, ty = target.y + jitter.y;
+  if (watching && now < react.avertUntil) {
+    tx = clamp(target.x + react.avertDir * 1.1, -1, 1);
+    ty = clamp(target.y + 0.4, -1, 1);
   }
 
   const k = 1 - Math.exp(-dt * 24);
   const kB = 1 - Math.exp(-dt * 15);
-  gaze.x += (target.x + jitter.x - gaze.x) * k;
-  gaze.y += (target.y + jitter.y - gaze.y) * k;
-  gazeB.x += (target.x + jitter.x - gazeB.x) * kB;
-  gazeB.y += (target.y + jitter.y - gazeB.y) * kB;
+  gaze.x += (tx - gaze.x) * k;
+  gaze.y += (ty - gaze.y) * k;
+  gazeB.x += (tx - gazeB.x) * kB;
+  gazeB.y += (ty - gazeB.y) * kB;
   gaze.near += (target.near - gaze.near) * (1 - Math.exp(-dt * 4));
   scope += ((scopeWanted ? 1 : 0) - scope) * (1 - Math.exp(-dt * 7));
 
