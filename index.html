@@ -17,6 +17,8 @@
     --iris: #a9c0c4;
     --iris-dark: #2c4046;
     --pupil: #020203;
+    --lid: #5a3a3d;
+    --lid-shade: #1d1113;
     --bone: #e4dcc6;
     --edge: #0c0d11;
     --scope: #14161b;
@@ -101,6 +103,7 @@ const C = {};
 for (const [key, name] of Object.entries({
   ground: "--ground", sclera: "--sclera", scleraRim: "--sclera-rim", vein: "--vein",
   iris: "--iris", irisDark: "--iris-dark", pupil: "--pupil", bone: "--bone", edge: "--edge",
+  lid: "--lid", lidShade: "--lid-shade",
   scope: "--scope", scopeHi: "--scope-hi", glass: "--glass",
 })) C[key] = css.getPropertyValue(name).trim();
 
@@ -112,9 +115,12 @@ const rand = (lo, hi) => lo + Math.random() * (hi - lo);
 const gaze = { x: 0, y: 0, near: 0.3 };
 const gazeB = { x: 0, y: 0 };
 const target = { x: 0, y: 0, near: 0.3 };
-const jitter = { x: 0, y: 0, next: 0 };
-const blink = { start: -1, next: 2500, duration: 110 };
-const idle = { next: 0 };
+const LINGER_MS = 2000;   // keeps staring this long after the person looks away
+const SCOPE_MS = 2800;    // how long the binoculars stay up for a far-away person
+let lidOpen = 0;          // 0 = lids shut, 1 = wide open
+let awakeUntil = 0;
+let wokeAt = 0;
+let pointerUntil = 0;
 let scope = 0;            // 0 = binoculars away, 1 = held up to the eyes
 let scopeWanted = false;
 let lastFaceAt = -Infinity;
@@ -171,7 +177,6 @@ let tileIndex = 0;
 let wholeFaces = [];
 let farMemory = [];
 let owner = null;
-const peek = { until: 0, next: 0 };
 
 // Runs the detector on one region of the camera picture. x, y, s are shares of the frame.
 function detectRegion(x, y, s, minScore) {
@@ -216,7 +221,6 @@ const react = {
   stare: 0,         // rises while someone looks back at it
   sizeSlow: 0,
   tilt: 0, tiltWanted: 0,
-  searchUntil: 0,   // just lost someone: hunt for them
 };
 
 function observe(face, sameTarget, now) {
@@ -303,38 +307,17 @@ function detect(now) {
   owner = own;
   const others = faces.filter(f => f !== own);
 
-  const near = others.filter(f => f.size >= FAR_SIZE);
-  const far = others.filter(f => f.size < FAR_SIZE);
-  let face = null, usingScope = false;
-  if (near.length && far.length) {
-    // Mostly watch whoever is closer, but check on the people further back now and then.
-    // Never break off a stare-down to peek at someone else.
-    if (react.stare > 0.3 && now > peek.until) peek.next = Math.max(peek.next, now + 2000);
-    if (now > peek.next) { peek.until = now + rand(2800, 4200); peek.next = peek.until + rand(7000, 13000); }
-    usingScope = now < peek.until;
-    face = pickFace(usingScope ? far : near);
-  } else if (far.length) {
-    face = pickFace(far);
-    usingScope = true;
-  } else if (near.length) {
-    face = pickFace(near);
-  }
-  scopeWanted = usingScope;
-
-  if (!face) {
-    if (lastFace) react.searchUntil = now + 4000;
-    lastFace = null;
-    if (own) setStatus("Ignoring you. Looking for other people.");
-    return;
-  }
+  // Anyone turned this way matters more than someone who is not.
+  const looking = others.filter(f => Math.abs(f.yaw) < 0.18);
+  const face = pickFace(looking.length ? looking : others);
+  if (!face) { lastFace = null; return; }
   observe(face, !!lastFace && Math.hypot(face.cx - lastFace.cx, face.cy - lastFace.cy) < 0.15, now);
   lastFace = face;
   lastFaceAt = now;
   // The front camera sees you un-mirrored, so a face on the picture's left is on the screen's right.
   target.x = clamp((0.5 - face.cx) * 2 * 1.5, -1, 1);
   target.y = clamp((face.cy - 0.5) * 2 * 1.5, -1, 1);
-  target.near = usingScope ? 0 : clamp((face.size - 0.1) / 0.4, 0, 1);
-  setStatus(usingScope ? "Watching someone far away" : others.length > 1 ? `Watching 1 of ${others.length} people` : "Watching someone");
+  target.near = face.size < FAR_SIZE ? 0 : clamp((face.size - 0.1) / 0.4, 0, 1);
 }
 
 async function startCamera() {
@@ -399,7 +382,7 @@ function pointTo(e) {
   target.x = clamp((e.clientX / W - 0.5) * 2.4, -1, 1);
   target.y = clamp((e.clientY / H - 0.5) * 2.4, -1, 1);
   target.near = 0.5;
-  idle.next = performance.now() + 2500;
+  pointerUntil = performance.now() + 2500;
 }
 canvas.addEventListener("pointermove", pointTo);
 canvas.addEventListener("pointerdown", pointTo);
@@ -475,7 +458,7 @@ function circle(x, y, r) {
   ctx.arc(x, y, r, 0, Math.PI * 2);
 }
 
-function drawEye(cx, cy, r, side, closed, g, sprite) {
+function drawEye(cx, cy, r, side, open, g, sprite) {
   // Eyes turn slightly inward for a close face.
   const gx = clamp(g.x - side * gaze.near * 0.16, -1, 1);
   const gy = g.y;
@@ -518,11 +501,31 @@ function drawEye(cx, cy, r, side, closed, g, sprite) {
   ctx.fillStyle = "rgba(255, 255, 255, .85)";
   circle(ix - irisR * 0.4, iy - irisR * 0.45, irisR * 0.13); ctx.fill();
 
-  // No eyelids. A blink is the eye snapping shut into the dark.
-  if (closed > 0.01) {
-    ctx.fillStyle = C.ground;
-    ctx.fillRect(cx - r, cy - r, r * 2, r * closed * 1.05);
-    ctx.fillRect(cx - r, cy + r - r * closed * 1.05, r * 2, r * closed * 1.05);
+  // Lids meet in a sagging seam below the middle when shut, and pull right out of sight when open.
+  if (open < 0.995) {
+    const seam = cy + r * 0.3;
+    const up = seam + (cy - r * 1.3 - seam) * open;
+    const lo = seam + (cy + r * 1.3 - seam) * open;
+    const skin = ctx.createRadialGradient(cx - r * 0.2, cy - r * 0.3, r * 0.1, cx, cy, r);
+    skin.addColorStop(0, C.lid);
+    skin.addColorStop(1, C.lidShade);
+    ctx.fillStyle = skin;
+    ctx.strokeStyle = C.edge;
+    ctx.lineWidth = Math.max(2, r * 0.035);
+    ctx.beginPath();
+    ctx.moveTo(cx - r * 1.1, lo - r * 0.15);
+    ctx.quadraticCurveTo(cx, lo + r * 0.15, cx + r * 1.1, lo - r * 0.15);
+    ctx.lineTo(cx + r * 1.1, cy + r * 1.6);
+    ctx.lineTo(cx - r * 1.1, cy + r * 1.6);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(cx - r * 1.1, up - r * 0.15);
+    ctx.quadraticCurveTo(cx, up + r * 0.15, cx + r * 1.1, up - r * 0.15);
+    ctx.lineTo(cx + r * 1.1, cy - r * 1.6);
+    ctx.lineTo(cx - r * 1.1, cy - r * 1.6);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
   }
   ctx.restore();
 }
@@ -599,7 +602,6 @@ function draw(now) {
   if (base <= 0) return;   // page is hidden or has no size yet
   const spread = Math.max(W * 0.25, base * 1.15);
   if (base !== spriteR) { sprites = [buildSprite(base, 7), buildSprite(base, 91)]; spriteR = base; }
-  const closed = blinkAmount(now);
   // Eyes bulge on a fright, flare when someone looks at them, and stay wide while stared at.
   const r = base * (1 + 0.16 * react.startle + 0.12 * react.notice + 0.1 * react.stare);
 
@@ -607,8 +609,8 @@ function draw(now) {
   ctx.translate(W / 2, H / 2);
   ctx.rotate(react.tilt);
   ctx.translate(-W / 2, -H / 2);
-  drawEye(W / 2 - spread, H / 2, r, -1, closed, gaze, sprites[0]);
-  drawEye(W / 2 + spread, H / 2, r, 1, closed, gazeB, sprites[1]);
+  drawEye(W / 2 - spread, H / 2, r, -1, lidOpen, gaze, sprites[0]);
+  drawEye(W / 2 + spread, H / 2, r, 1, lidOpen, gazeB, sprites[1]);
   if (scope > 0.01) drawBinoculars(W / 2, H / 2, base, spread, scope);
   ctx.restore();
 }
@@ -616,40 +618,33 @@ function draw(now) {
 // ---------- Animation ----------
 
 function update(now, dt) {
-  const sinceFace = now - lastFaceAt;
-  if (sinceFace > 600) scopeWanted = false;
-
-  // Nobody to watch: look about the room.
-  if (sinceFace > 1200 && now > idle.next) {
-    target.x = rand(-0.8, 0.8);
-    target.y = rand(-0.4, 0.4);
-    target.near = 0.2;
-    // Right after losing someone it hunts about quickly, then settles.
-    idle.next = now + (now < react.searchUntil ? rand(250, 650) : rand(1200, 3800));
-    if (detector && sinceFace > 3000 && !owner) setStatus("Looking for people");
+  const watching = now - lastFaceAt < 600;
+  // It rests with its lids shut. Someone looking at it wakes it, and it stares
+  // at them for as long as they keep looking, plus a moment after.
+  const staredAt = watching && react.facingSince > 0;
+  if (staredAt) {
+    if (now > awakeUntil) wokeAt = now;
+    awakeUntil = now + LINGER_MS;
+  }
+  const awake = now < awakeUntil || now < pointerUntil;
+  lidOpen += ((awake ? 1 : 0) - lidOpen) * (1 - Math.exp(-dt * (awake ? 14 : 2.5)));
+  // A far-away watcher gets the binoculars first, then the bare stare.
+  scopeWanted = now < awakeUntil && !!lastFace && lastFace.size < FAR_SIZE && now - wokeAt < SCOPE_MS;
+  if (detector) {
+    setStatus(awake ? "" : owner && !lastFace ? "Ignoring you. Resting until someone else looks at it." : "Resting until someone looks at it.");
   }
 
-  const watching = sinceFace < 600;
-  // Someone looking back gets stared at harder, straight away, for as long as they keep it up.
-  const staredAt = watching && react.facingSince > 0;
   react.stare += ((staredAt ? 1 : 0) - react.stare) * (1 - Math.exp(-dt * (staredAt ? 5 : 1.2)));
   react.notice *= Math.exp(-dt * 3);
   react.startle *= Math.exp(-dt * 2.2);
-  if (!watching) react.tiltWanted = 0;
+  // Nothing at all shows while it rests. It only reacts once someone has looked at it.
+  if (!awake) { react.startle = 0; react.tiltWanted = 0; }
   react.tilt += (react.tiltWanted - react.tilt) * (1 - Math.exp(-dt * 5));
 
-  // Small darts while idle. Watching a person, the stare is dead still and it does not blink.
-  if (now > jitter.next) {
-    jitter.x = rand(-0.03, 0.03);
-    jitter.y = rand(-0.02, 0.02);
-    jitter.next = now + rand(350, 1600);
-  }
-  if (watching) {
-    jitter.x = jitter.y = 0;
-    if (blink.start < 0) blink.next = Math.max(blink.next, now + 900);
-  }
-  const tx = target.x + jitter.x, ty = target.y + jitter.y;
-
+  // Under closed lids the eyes already point at whoever is there, so they open locked on.
+  // The stare is dead still: no wandering, no darting, no blinking.
+  const tx = watching || awake ? target.x : 0;
+  const ty = watching || awake ? target.y : 0.1;
   const k = 1 - Math.exp(-dt * 24);
   const kB = 1 - Math.exp(-dt * 15);
   gaze.x += (tx - gaze.x) * k;
@@ -658,21 +653,6 @@ function update(now, dt) {
   gazeB.y += (ty - gazeB.y) * kB;
   gaze.near += (target.near - gaze.near) * (1 - Math.exp(-dt * 4));
   scope += ((scopeWanted ? 1 : 0) - scope) * (1 - Math.exp(-dt * 7));
-
-  // It rarely blinks, and when it does it is fast.
-  if (blink.start < 0 && now > blink.next) {
-    blink.start = now;
-    blink.duration = rand(90, 130);
-  }
-  if (blink.start >= 0 && now - blink.start > blink.duration) {
-    blink.start = -1;
-    blink.next = now + rand(4500, 11000);
-  }
-}
-
-function blinkAmount(now) {
-  if (blink.start < 0) return 0;
-  return Math.sin(Math.PI * clamp((now - blink.start) / blink.duration, 0, 1));
 }
 
 let previous = performance.now();
