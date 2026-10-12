@@ -55,6 +55,8 @@
   }
   #start[hidden] { display: none; }
   #start p { margin: 0; max-width: 46ch; color: var(--text-dim); font-size: 13px; }
+  #ignoreRow { display: flex; align-items: center; gap: 8px; font-size: 14px; min-height: 32px; }
+  #ignoreRow input { width: 20px; height: 20px; accent-color: var(--iris); }
   button {
     font: inherit; font-weight: 600;
     color: var(--ground); background: var(--sclera);
@@ -84,6 +86,7 @@
 <div id="start">
   <button id="go" type="button">Start the eyes</button>
   <p>You will be asked to allow the camera. The picture stays on this device. Nothing is recorded or sent anywhere.</p>
+  <label id="ignoreRow"><input type="checkbox" id="ignoreMe" checked> Ignore the closest person (me)</label>
   <p id="hint"></p>
 </div>
 <div id="status" aria-live="polite"></div>
@@ -159,42 +162,98 @@ canvas.addEventListener("pointerup", e => {
 // ---------- Face tracking ----------
 
 // Sizes are a face's height as a share of the picture height.
-const OWNER_SIZE = 0.2;   // the biggest face at least this large is the person holding the phone: ignored
-const FAR_SIZE = 0.14;    // smaller than this counts as far away: binoculars
-const FAR_MEMORY_MS = 2600;
+// A size is the height of the box the detector draws round a face (brow to chin),
+// as a share of the picture height. Roughly 0.17 at 80 cm and 0.06 at 2.5 m.
+const OWNER_SIZE = 0.17;  // the biggest face at least this large is the person holding the phone: ignored
+const FAR_SIZE = 0.06;    // smaller than this counts as far away: binoculars
+const LOOKING_YAW = 0.3;  // head turned less than this counts as looking at it
+const MEMORY_MS = 8000;   // longer than one full sweep, so nobody is forgotten between visits
 const DETECT_GAP_MS = 30;
-const WORK_WIDTH = 320;   // the detector only looks at a tiny picture, so feed it a small one
+const WORK_SIZE = 192;    // the detector looks at a tiny square picture, so feed it one
 
-// Distant faces vanish when the whole frame is shrunk for the detector.
-// To find them, the frame is also searched in zoomed-in pieces: 2x zoom and 3x zoom.
-const tiles = [];
-for (const y of [0, 0.25, 0.5]) for (const x of [0, 0.25, 0.5]) tiles.push({ x, y, s: 0.5 });
-for (const y of [0, 0.22, 0.44, 0.66]) for (const x of [0, 0.22, 0.44, 0.66]) tiles.push({ x, y, s: 0.34 });
+// The detector only finds a face that fills a fair share of the square it is given.
+// So the camera picture is searched in square pieces at three zoom levels:
+// big pieces for close faces, small ones for people far away.
+// Measured: it needs the face to be at least an eighth of the square's height, and under half.
+const ZOOMS = [
+  { s: 1, step: 0.5, min: 0.6 },
+  { s: 0.5, step: 0.5, min: 0.75 },
+  { s: 0.34, step: 0.65, min: 0.75 },
+  { s: 0.22, step: 0.7, min: 0.8 },
+];
+let tiles = [];       // each is { x, y, side } in camera pixels
+let sweep = [];       // the order the pieces are searched in
+let tilesFor = "";
+function buildTiles(vw, vh) {
+  tiles = [];
+  const big = [], small = [];
+  // First the whole picture, padded out to a square, for a face right up against the camera.
+  const full = Math.max(vw, vh);
+  big.push(0);
+  tiles.push({ x: Math.round((vw - full) / 2), y: Math.round((vh - full) / 2), side: full, min: 0.6 });
+  for (const z of ZOOMS) {
+    const side = Math.round(z.s * Math.min(vw, vh));
+    const nx = Math.max(1, Math.ceil((vw - side) / (side * z.step)) + 1);
+    const ny = Math.max(1, Math.ceil((vh - side) / (side * z.step)) + 1);
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      (z.s === 1 ? big : small).push(tiles.length);
+      tiles.push({
+        x: nx > 1 ? Math.round(i * (vw - side) / (nx - 1)) : Math.round((vw - side) / 2),
+        y: ny > 1 ? Math.round(j * (vh - side) / (ny - 1)) : Math.round((vh - side) / 2),
+        side, min: z.min,
+      });
+    }
+  }
+  // Close faces move fast on screen, so the big pieces come round much more often.
+  sweep = [];
+  let b = 0;
+  small.forEach((t, i) => {
+    if (i % 4 === 0) sweep.push(big[b++ % big.length]);
+    sweep.push(t);
+  });
+  tilesFor = vw + "x" + vh;
+}
+
 const work = document.createElement("canvas");
+work.width = work.height = WORK_SIZE;
 const workCtx = work.getContext("2d", { willReadFrequently: true });
+// Untick the box on the start screen to try it out alone.
+const ignoreBox = document.getElementById("ignoreMe");
+let ignoreNearest = true;
+try { ignoreBox.checked = localStorage.getItem("ignoreNearest") !== "0"; } catch { /* storage may be blocked */ }
+ignoreNearest = ignoreBox.checked;
+ignoreBox.addEventListener("change", () => {
+  ignoreNearest = ignoreBox.checked;
+  try { localStorage.setItem("ignoreNearest", ignoreNearest ? "1" : "0"); } catch { /* storage may be blocked */ }
+});
 let step = 0;
-let tileIndex = 0;
-let wholeFaces = [];
-let farMemory = [];
+let sweepIndex = 0;
+let seen = [];        // every face found lately, with the piece it was found in
 let owner = null;
 
-// Runs the detector on one region of the camera picture. x, y, s are shares of the frame.
-function detectRegion(x, y, s, minScore) {
+// Searches one piece of the camera picture and replaces what was known about it.
+function scanTile(index, now) {
+  const t = tiles[index];
   const vw = video.videoWidth, vh = video.videoHeight;
-  const wh = Math.round(WORK_WIDTH * vh / vw);
-  if (work.width !== WORK_WIDTH || work.height !== wh) { work.width = WORK_WIDTH; work.height = wh; }
-  workCtx.drawImage(video, x * vw, y * vh, s * vw, s * vh, 0, 0, WORK_WIDTH, wh);
-  const out = [];
+  const k = t.side / WORK_SIZE;
+  // Draw only the part of the piece that lies inside the picture; the rest stays black.
+  const sx = Math.max(0, t.x), sy = Math.max(0, t.y);
+  const sw = Math.min(vw, t.x + t.side) - sx, sh = Math.min(vh, t.y + t.side) - sy;
+  workCtx.fillStyle = "#000";
+  workCtx.fillRect(0, 0, WORK_SIZE, WORK_SIZE);
+  workCtx.drawImage(video, sx, sy, sw, sh, (sx - t.x) / k, (sy - t.y) / k, sw / k, sh / k);
+  seen = seen.filter(f => f.tile !== index);
   for (const d of detector.detect(work).detections || []) {
     const b = d.boundingBox;
     if (!b) continue;
     const score = d.categories && d.categories[0] ? d.categories[0].score : 1;
-    if (score < minScore) continue;
+    if (score < t.min) continue;
     const face = {
-      cx: x + (b.originX + b.width / 2) / WORK_WIDTH * s,
-      cy: y + (b.originY + b.height / 2) / wh * s,
-      size: b.height / wh * s,
+      cx: (t.x + (b.originX + b.width / 2) * k) / vw,
+      cy: (t.y + (b.originY + b.height / 2) * k) / vh,
+      size: b.height * k / vh,
       yaw: 1, roll: 0,
+      tile: index, t: now,
     };
     // Landmarks: 0 and 1 are the eyes, 2 the nose tip, 4 and 5 the ears.
     const p = d.keypoints;
@@ -202,11 +261,10 @@ function detectRegion(x, y, s, minScore) {
       const earGap = Math.abs(p[5].x - p[4].x);
       // Nose centred between the ears means the head is turned toward the camera.
       if (earGap > 0.001) face.yaw = (p[2].x - (p[4].x + p[5].x) / 2) / earGap;
-      face.roll = Math.atan2((p[1].y - p[0].y) * wh, (p[1].x - p[0].x) * WORK_WIDTH);
+      face.roll = Math.atan2(p[1].y - p[0].y, p[1].x - p[0].x);
     }
-    out.push(face);
+    seen.push(face);
   }
-  return out;
 }
 
 // ---------- Reactions ----------
@@ -230,7 +288,7 @@ function observe(face, sameTarget, now) {
     react.sizeSlow = face.size;
   }
   const wasFacing = react.facing > 0.6;
-  react.facing += ((Math.abs(face.yaw) < 0.18 ? 1 : 0) - react.facing) * 0.12;
+  react.facing += ((Math.abs(face.yaw) < LOOKING_YAW ? 1 : 0) - react.facing) * 0.12;
   const isFacing = react.facing > 0.6;
 
   if (isFacing && !wasFacing) {
@@ -251,11 +309,9 @@ function observe(face, sameTarget, now) {
   react.tiltWanted = clamp(-face.roll * 0.7, -0.3, 0.3);
 }
 
-function scanTile(index, now) {
-  const t = tiles[index];
-  const found = detectRegion(t.x, t.y, t.s, 0.7);
-  farMemory = farMemory.filter(f => f.tile !== index);
-  for (const f of found) { f.tile = index; f.t = now; farMemory.push(f); }
+// Distance between two faces, in picture heights.
+function apart(a, b) {
+  return Math.hypot((a.cx - b.cx) * video.videoWidth / video.videoHeight, a.cy - b.cy);
 }
 
 // Keeps following the same person unless someone else is clearly bigger in view.
@@ -263,7 +319,7 @@ function pickFace(faces) {
   let best = null, bestScore = 0;
   for (const f of faces) {
     let score = f.size * f.size;
-    if (lastFace && Math.hypot(f.cx - lastFace.cx, f.cy - lastFace.cy) < 0.15) score *= 1.4;
+    if (lastFace && apart(f, lastFace) < 0.15) score *= 1.4;
     if (score > bestScore) { bestScore = score; best = f; }
   }
   return best;
@@ -275,49 +331,56 @@ function detect(now) {
   if (now - lastDetectAt < DETECT_GAP_MS) return;
   lastDetectAt = now;
 
-  // One detector run per screen frame keeps the animation smooth:
-  // whole picture, then two zoomed pieces, and repeat.
-  try {
-    if (step % 3 === 0) {
-      wholeFaces = detectRegion(0, 0, 1, 0.5);
-    } else if (step % 3 === 1 && lastFace && lastFace.tile !== undefined) {
-      scanTile(lastFace.tile, now);   // keep a close watch on the piece holding the current target
-    } else {
-      scanTile(tileIndex, now);
-      tileIndex = (tileIndex + 1) % tiles.length;
-    }
-  } catch { return; }
-  step++;
+  if (tilesFor !== video.videoWidth + "x" + video.videoHeight) {
+    buildTiles(video.videoWidth, video.videoHeight);
+    seen = []; sweepIndex = 0; lastFace = null;
+  }
 
-  // Merge: drop zoomed finds that are stale or are a face the whole-picture pass already has.
-  farMemory = farMemory.filter(f => now - f.t < FAR_MEMORY_MS);
-  const faces = wholeFaces.slice();
-  for (const f of farMemory) {
-    if (!faces.some(g => Math.hypot(g.cx - f.cx, g.cy - f.cy) < Math.max(0.06, g.size * 0.6))) faces.push(f);
+  // One detector run per screen frame keeps the animation smooth. Every other run
+  // rechecks the piece holding the person being watched; the rest sweep the picture.
+  // While it rests with nobody in view there is nothing to animate, so it sweeps faster.
+  const until = performance.now() + (lidOpen < 0.05 && !lastFace ? 10 : 0);
+  try {
+    do {
+      if (step % 2 === 0 && lastFace && tiles[lastFace.tile]) {
+        scanTile(lastFace.tile, now);
+      } else {
+        scanTile(sweep[sweepIndex], now);
+        sweepIndex = (sweepIndex + 1) % sweep.length;
+      }
+      step++;
+    } while (performance.now() < until);
+  } catch { return; }
+
+  // The same face turns up in several overlapping pieces. Keep the fullest view of each.
+  seen = seen.filter(f => now - f.t < MEMORY_MS);
+  const faces = [];
+  for (const f of seen.slice().sort((a, b) => b.size - a.size)) {
+    if (!faces.some(g => apart(g, f) < Math.max(0.05, g.size * 0.8))) faces.push(f);
   }
 
   // The closest face is the person holding the phone. Leave them out.
   let own = null, ownScore = 0;
   for (const f of faces) {
-    if (f.size < OWNER_SIZE) continue;
+    if (!ignoreNearest || f.size < OWNER_SIZE) continue;
     let score = f.size;
-    if (owner && Math.hypot(f.cx - owner.cx, f.cy - owner.cy) < 0.15) score *= 1.3;
+    if (owner && apart(f, owner) < 0.15) score *= 1.3;
     if (score > ownScore) { ownScore = score; own = f; }
   }
   owner = own;
   const others = faces.filter(f => f !== own);
 
   // Anyone turned this way matters more than someone who is not.
-  const looking = others.filter(f => Math.abs(f.yaw) < 0.18);
+  const looking = others.filter(f => Math.abs(f.yaw) < LOOKING_YAW);
   const face = pickFace(looking.length ? looking : others);
   if (!face) { lastFace = null; return; }
-  observe(face, !!lastFace && Math.hypot(face.cx - lastFace.cx, face.cy - lastFace.cy) < 0.15, now);
+  observe(face, !!lastFace && apart(face, lastFace) < 0.15, now);
   lastFace = face;
   lastFaceAt = now;
   // The front camera sees you un-mirrored, so a face on the picture's left is on the screen's right.
   target.x = clamp((0.5 - face.cx) * 2 * 1.5, -1, 1);
   target.y = clamp((face.cy - 0.5) * 2 * 1.5, -1, 1);
-  target.near = face.size < FAR_SIZE ? 0 : clamp((face.size - 0.1) / 0.4, 0, 1);
+  target.near = face.size < FAR_SIZE ? 0 : clamp((face.size - 0.05) / 0.25, 0, 1);
 }
 
 async function startCamera() {
