@@ -210,12 +210,10 @@ function detectRegion(x, y, s, minScore) {
 const react = {
   facing: 0,        // 0 to 1, how sure it is that the person is looking back
   facingSince: 0,
-  avertUntil: 0,    // caught staring: look away until this time
-  avertDir: 1,
-  avertReady: 0,
+  notice: 0,        // jumps to 1 the moment someone looks at it, then fades
   startle: 0,       // jumps to 1 when someone rushes closer, then fades
   startleReady: 0,
-  stare: 0,         // builds while someone holds its gaze
+  stare: 0,         // rises while someone looks back at it
   sizeSlow: 0,
   tilt: 0, tiltWanted: 0,
   searchUntil: 0,   // just lost someone: hunt for them
@@ -233,12 +231,8 @@ function observe(face, sameTarget, now) {
 
   if (isFacing && !wasFacing) {
     react.facingSince = now;
-    // They looked straight at it. Pretend it was not staring.
-    if (now > react.avertReady) {
-      react.avertUntil = now + rand(900, 1500);
-      react.avertDir = target.x > 0 ? -1 : 1;
-      react.avertReady = now + 6000;
-    }
+    // They looked straight at it. Let them know it noticed.
+    react.notice = 1;
   }
   if (!isFacing) react.facingSince = 0;
 
@@ -314,6 +308,8 @@ function detect(now) {
   let face = null, usingScope = false;
   if (near.length && far.length) {
     // Mostly watch whoever is closer, but check on the people further back now and then.
+    // Never break off a stare-down to peek at someone else.
+    if (react.stare > 0.3 && now > peek.until) peek.next = Math.max(peek.next, now + 2000);
     if (now > peek.next) { peek.until = now + rand(2800, 4200); peek.next = peek.until + rand(7000, 13000); }
     usingScope = now < peek.until;
     face = pickFace(usingScope ? far : near);
@@ -600,11 +596,12 @@ function draw(now) {
 
   // Sized so the eyes and the binoculars fit both upright and sideways.
   const base = Math.min(W * 0.19, H * 0.3);
+  if (base <= 0) return;   // page is hidden or has no size yet
   const spread = Math.max(W * 0.25, base * 1.15);
   if (base !== spriteR) { sprites = [buildSprite(base, 7), buildSprite(base, 91)]; spriteR = base; }
   const closed = blinkAmount(now);
-  // Eyes bulge on a fright and during a stare-down.
-  const r = base * (1 + 0.16 * react.startle + 0.1 * react.stare);
+  // Eyes bulge on a fright, flare when someone looks at them, and stay wide while stared at.
+  const r = base * (1 + 0.16 * react.startle + 0.12 * react.notice + 0.1 * react.stare);
 
   ctx.save();
   ctx.translate(W / 2, H / 2);
@@ -633,25 +630,25 @@ function update(now, dt) {
   }
 
   const watching = sinceFace < 600;
-  const held = watching && react.facingSince && now > react.avertUntil ? now - react.facingSince : 0;
-  react.stare += ((held > 3500 ? 1 : 0) - react.stare) * (1 - Math.exp(-dt * 1.5));
+  // Someone looking back gets stared at harder, straight away, for as long as they keep it up.
+  const staredAt = watching && react.facingSince > 0;
+  react.stare += ((staredAt ? 1 : 0) - react.stare) * (1 - Math.exp(-dt * (staredAt ? 5 : 1.2)));
+  react.notice *= Math.exp(-dt * 3);
   react.startle *= Math.exp(-dt * 2.2);
   if (!watching) react.tiltWanted = 0;
   react.tilt += (react.tiltWanted - react.tilt) * (1 - Math.exp(-dt * 5));
 
-  // Tiny darts keep a held stare from looking frozen. In a stare-down they become a tremble.
+  // Small darts while idle. Watching a person, the stare is dead still and it does not blink.
   if (now > jitter.next) {
     jitter.x = rand(-0.03, 0.03);
     jitter.y = rand(-0.02, 0.02);
-    jitter.next = now + (react.stare > 0.5 ? rand(40, 110) : rand(350, 1600));
+    jitter.next = now + rand(350, 1600);
   }
-
-  // Caught staring: glance off to the side and down until the coast is clear.
-  let tx = target.x + jitter.x, ty = target.y + jitter.y;
-  if (watching && now < react.avertUntil) {
-    tx = clamp(target.x + react.avertDir * 1.1, -1, 1);
-    ty = clamp(target.y + 0.4, -1, 1);
+  if (watching) {
+    jitter.x = jitter.y = 0;
+    if (blink.start < 0) blink.next = Math.max(blink.next, now + 900);
   }
+  const tx = target.x + jitter.x, ty = target.y + jitter.y;
 
   const k = 1 - Math.exp(-dt * 24);
   const kB = 1 - Math.exp(-dt * 15);
