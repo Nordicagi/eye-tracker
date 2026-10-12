@@ -6,20 +6,27 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Eyes">
-<meta name="theme-color" content="#0b0d12">
+<meta name="theme-color" content="#07080b">
 <title>Watching Eyes</title>
 <style>
   :root {
-    --ground: #0b0d12;
-    --lid: #161a23;
-    --lid-edge: #05060a;
-    --sclera: #ffffff;
-    --sclera-shade: #dfe3ee;
-    --iris: #4a8fe8;
-    --iris-dark: #1d3f8f;
-    --iris-glow: #8fe3f5;
-    --blush: rgba(255, 130, 150, .8);
-    --pupil: #050607;
+    --ground: #07080b;
+    --metal-hi: #aeb2ba;
+    --metal: #6c717b;
+    --metal-lo: #353840;
+    --metal-edge: #0c0d11;
+    --socket: #020203;
+    --sclera: #f1ede2;
+    --sclera-shade: #a39c8c;
+    --vein: rgba(170, 30, 30, .35);
+    --iris: #9db8c4;
+    --iris-dark: #2f4650;
+    --pupil: #030304;
+    --tooth: #ddd6c2;
+    --bone: #e4dcc6;
+    --scope: #14161b;
+    --scope-hi: #343944;
+    --glass: rgba(90, 210, 195, .16);
     --text: #d9d5cb;
     --text-dim: #7d8290;
     color-scheme: dark;
@@ -38,7 +45,7 @@
     -webkit-touch-callout: none;
     touch-action: none;
   }
-  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  canvas#stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
   /* iOS only keeps decoding frames for a video that is technically on screen */
   video { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
   #start {
@@ -47,7 +54,7 @@
     gap: 14px;
     padding: 24px 24px calc(40px + env(safe-area-inset-bottom, 0px));
     text-align: center;
-    background: linear-gradient(to top, rgba(11, 13, 18, .92) 30%, rgba(11, 13, 18, 0) 70%);
+    background: linear-gradient(to top, rgba(7, 8, 11, .94) 22%, rgba(7, 8, 11, 0) 48%);
   }
   #start[hidden] { display: none; }
   #start p { margin: 0; max-width: 30ch; color: var(--text-dim); font-size: 14px; }
@@ -66,7 +73,6 @@
     font-size: 12px; letter-spacing: .04em;
     color: var(--text-dim);
     pointer-events: none;
-    transition: opacity .6s;
   }
 </style>
 </head>
@@ -92,25 +98,29 @@ const startPanel = document.getElementById("start");
 const statusEl = document.getElementById("status");
 const css = getComputedStyle(document.documentElement);
 const color = name => css.getPropertyValue(name).trim();
-const C = {
-  ground: color("--ground"), lid: color("--lid"), lidEdge: color("--lid-edge"),
-  sclera: color("--sclera"), scleraShade: color("--sclera-shade"),
-  iris: color("--iris"), irisDark: color("--iris-dark"), irisGlow: color("--iris-glow"),
-  blush: color("--blush"), pupil: color("--pupil"),
-};
+const C = {};
+for (const [key, name] of Object.entries({
+  ground: "--ground", metalHi: "--metal-hi", metal: "--metal", metalLo: "--metal-lo", metalEdge: "--metal-edge",
+  socket: "--socket", sclera: "--sclera", scleraShade: "--sclera-shade", vein: "--vein",
+  iris: "--iris", irisDark: "--iris-dark", pupil: "--pupil", tooth: "--tooth", bone: "--bone",
+  scope: "--scope", scopeHi: "--scope-hi", glass: "--glass",
+})) C[key] = color(name);
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const rand = (lo, hi) => lo + Math.random() * (hi - lo);
 
 // Gaze runs from -1 to 1 on each axis. "near" is how close the watched face is, 0 to 1.
+// The two eyes are driven separately so one lags the other a touch, like mismatched servos.
 const gaze = { x: 0, y: 0, near: 0.3 };
+const gazeB = { x: 0, y: 0 };
 const target = { x: 0, y: 0, near: 0.3 };
 const jitter = { x: 0, y: 0, next: 0 };
-const blink = { start: -1, next: 1500, duration: 150 };
+const blink = { start: -1, next: 2500, duration: 110 };
 const idle = { next: 0 };
+let scope = 0;            // 0 = binoculars away, 1 = held up to the eyes
+let scopeWanted = false;
 let lastFaceAt = -Infinity;
 let lastFace = null;
-let pointerActive = false;
 let detector = null;
 let lastVideoTime = -1;
 let W = 0, H = 0;
@@ -132,18 +142,56 @@ resize();
 
 // ---------- Face tracking ----------
 
-// Keeps following the same person unless someone else is clearly closer.
-function pickFace(detections, vw, vh) {
-  let best = null, bestScore = 0;
+// A face smaller than this share of the picture height counts as far away.
+const FAR_SIZE = 0.14;
+const FAR_MEMORY_MS = 2000;
+const TILES_PER_FRAME = 2;
+
+// The detector shrinks whatever it is given to a tiny picture, so distant faces vanish.
+// To find them, the frame is also searched in zoomed-in pieces: 2x zoom and 3x zoom.
+const tiles = [];
+for (const y of [0, 0.25, 0.5]) for (const x of [0, 0.25, 0.5]) tiles.push({ x, y, s: 0.5 });
+for (const y of [0, 0.22, 0.44, 0.66]) for (const x of [0, 0.22, 0.44, 0.66]) tiles.push({ x, y, s: 0.34 });
+const tileCanvas = document.createElement("canvas");
+const tileCtx = tileCanvas.getContext("2d", { willReadFrequently: true });
+let tileIndex = 0;
+let farMemory = [];
+const peek = { until: 0, next: 0 };
+
+function toFaces(detections, ox, oy, vw, vh, minScore) {
+  const out = [];
   for (const d of detections) {
     const b = d.boundingBox;
     if (!b) continue;
-    const cx = (b.originX + b.width / 2) / vw;
-    const cy = (b.originY + b.height / 2) / vh;
-    const size = b.height / vh;
-    let score = b.width * b.height;
-    if (lastFace && Math.hypot(cx - lastFace.cx, cy - lastFace.cy) < 0.15) score *= 1.4;
-    if (score > bestScore) { bestScore = score; best = { cx, cy, size }; }
+    const score = d.categories && d.categories[0] ? d.categories[0].score : 1;
+    if (score < minScore) continue;
+    out.push({
+      cx: (ox + b.originX + b.width / 2) / vw,
+      cy: (oy + b.originY + b.height / 2) / vh,
+      size: b.height / vh,
+    });
+  }
+  return out;
+}
+
+function scanTile(index, vw, vh, now) {
+  const t = tiles[index];
+  const sx = Math.round(t.x * vw), sy = Math.round(t.y * vh);
+  const sw = Math.round(t.s * vw), sh = Math.round(t.s * vh);
+  if (tileCanvas.width !== sw || tileCanvas.height !== sh) { tileCanvas.width = sw; tileCanvas.height = sh; }
+  tileCtx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+  const found = toFaces(detector.detect(tileCanvas).detections || [], sx, sy, vw, vh, 0.7);
+  farMemory = farMemory.filter(f => f.tile !== index);
+  for (const f of found) farMemory.push({ ...f, tile: index, t: now });
+}
+
+// Keeps following the same person unless someone else is clearly bigger in view.
+function pickFace(faces) {
+  let best = null, bestScore = 0;
+  for (const f of faces) {
+    let score = f.size * f.size;
+    if (lastFace && Math.hypot(f.cx - lastFace.cx, f.cy - lastFace.cy) < 0.15) score *= 1.4;
+    if (score > bestScore) { bestScore = score; best = f; }
   }
   return best;
 }
@@ -151,25 +199,64 @@ function pickFace(detections, vw, vh) {
 function detect(now) {
   if (!detector || video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
-  let result;
-  try { result = detector.detectForVideo(video, now); } catch { return; }
-  const faces = result.detections || [];
-  const face = pickFace(faces, video.videoWidth, video.videoHeight);
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return;
+
+  let whole;
+  try {
+    whole = toFaces(detector.detect(video).detections || [], 0, 0, vw, vh, 0.5);
+    for (let i = 0; i < TILES_PER_FRAME; i++) {
+      scanTile(tileIndex, vw, vh, now);
+      tileIndex = (tileIndex + 1) % tiles.length;
+    }
+  } catch { return; }
+
+  // Merge: drop zoomed finds that are stale or are the same face seen twice.
+  farMemory = farMemory.filter(f => now - f.t < FAR_MEMORY_MS);
+  const faces = whole.slice();
+  for (const f of farMemory) {
+    if (!faces.some(g => Math.hypot(g.cx - f.cx, g.cy - f.cy) < Math.max(0.06, g.size * 0.6))) faces.push(f);
+  }
+
+  const near = faces.filter(f => f.size >= FAR_SIZE);
+  const far = faces.filter(f => f.size < FAR_SIZE);
+  let face = null, usingScope = false;
+  if (near.length && far.length) {
+    // Mostly watch whoever is close, but check on the people behind them now and then.
+    if (now > peek.next) { peek.until = now + rand(2800, 4200); peek.next = peek.until + rand(7000, 13000); }
+    usingScope = now < peek.until;
+    face = pickFace(usingScope ? far : near);
+  } else if (far.length) {
+    face = pickFace(far);
+    usingScope = true;
+  } else if (near.length) {
+    face = pickFace(near);
+  }
+  scopeWanted = usingScope;
+
   if (!face) { lastFace = null; return; }
   lastFace = face;
   lastFaceAt = now;
   // The front camera sees you un-mirrored, so a face on the picture's left is on the screen's right.
   target.x = clamp((0.5 - face.cx) * 2 * 1.5, -1, 1);
   target.y = clamp((face.cy - 0.5) * 2 * 1.5, -1, 1);
-  target.near = clamp((face.size - 0.12) / 0.5, 0, 1);
-  setStatus(faces.length > 1 ? `Watching the nearest of ${faces.length} people` : "");
+  target.near = usingScope ? 0 : clamp((face.size - 0.12) / 0.5, 0, 1);
+  if (usingScope) setStatus(near.length ? "Spotted someone behind you" : "Watching someone far away");
+  else setStatus(faces.length > 1 ? `Watching the nearest of ${faces.length} people` : "");
 }
 
 async function startCamera() {
+  // Ask for the sharpest picture the front camera has; distant faces need the pixels.
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: false,
-    video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+    video: { facingMode: "user", width: { ideal: 1920 }, height: { ideal: 1080 } },
   });
+  // Where the camera lets a page set zoom, pull it all the way out for the widest view.
+  try {
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.zoom && typeof caps.zoom.min === "number") await track.applyConstraints({ advanced: [{ zoom: caps.zoom.min }] });
+  } catch { /* zoom control is optional */ }
   video.srcObject = stream;
   await video.play();
 }
@@ -179,7 +266,7 @@ async function startDetector() {
   const fileset = await FilesetResolver.forVisionTasks(`${MP_BASE}/wasm`);
   detector = await FaceDetector.createFromOptions(fileset, {
     baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
-    runningMode: "VIDEO",
+    runningMode: "IMAGE",
     minDetectionConfidence: 0.5,
   });
 }
@@ -216,7 +303,6 @@ document.getElementById("go").addEventListener("click", async () => {
 
 // Finger or mouse steers the eyes when there is no face to follow.
 function pointTo(e) {
-  pointerActive = true;
   if (performance.now() - lastFaceAt < 800) return;
   target.x = clamp((e.clientX / W - 0.5) * 2.4, -1, 1);
   target.y = clamp((e.clientY / H - 0.5) * 2.4, -1, 1);
@@ -230,6 +316,7 @@ canvas.addEventListener("pointerdown", pointTo);
 
 function update(now, dt) {
   const sinceFace = now - lastFaceAt;
+  if (sinceFace > 600) scopeWanted = false;
 
   // Nobody around: look about the room.
   if (sinceFace > 1200 && now > idle.next) {
@@ -242,24 +329,28 @@ function update(now, dt) {
 
   // Tiny darts keep a held stare from looking frozen.
   if (now > jitter.next) {
-    jitter.x = rand(-0.035, 0.035);
-    jitter.y = rand(-0.025, 0.025);
+    jitter.x = rand(-0.03, 0.03);
+    jitter.y = rand(-0.02, 0.02);
     jitter.next = now + rand(350, 1600);
   }
 
-  const k = 1 - Math.exp(-dt * 14);
+  const k = 1 - Math.exp(-dt * 16);
+  const kB = 1 - Math.exp(-dt * 9);
   gaze.x += (target.x + jitter.x - gaze.x) * k;
   gaze.y += (target.y + jitter.y - gaze.y) * k;
+  gazeB.x += (target.x + jitter.x - gazeB.x) * kB;
+  gazeB.y += (target.y + jitter.y - gazeB.y) * kB;
   gaze.near += (target.near - gaze.near) * (1 - Math.exp(-dt * 4));
+  scope += ((scopeWanted ? 1 : 0) - scope) * (1 - Math.exp(-dt * 7));
 
+  // It rarely blinks, and when it does the shutters snap.
   if (blink.start < 0 && now > blink.next) {
     blink.start = now;
-    blink.duration = rand(120, 190);
+    blink.duration = rand(90, 130);
   }
   if (blink.start >= 0 && now - blink.start > blink.duration) {
     blink.start = -1;
-    // Now and then, a quick double blink.
-    blink.next = now + (Math.random() < 0.15 ? rand(120, 260) : rand(2200, 6500));
+    blink.next = now + rand(4500, 11000);
   }
 }
 
@@ -268,123 +359,290 @@ function blinkAmount(now) {
   return Math.sin(Math.PI * clamp((now - blink.start) / blink.duration, 0, 1));
 }
 
-function drawEye(cx, cy, r, side, closed) {
+function circle(x, y, r) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+}
+
+function bolt(x, y, r) {
+  ctx.fillStyle = C.metalLo;
+  ctx.strokeStyle = C.metalEdge;
+  ctx.lineWidth = r * 0.3;
+  circle(x, y, r); ctx.fill(); ctx.stroke();
+  ctx.strokeStyle = C.metalHi;
+  ctx.lineWidth = r * 0.28;
+  ctx.beginPath();
+  ctx.moveTo(x - r * 0.55, y - r * 0.3);
+  ctx.lineTo(x + r * 0.55, y + r * 0.3);
+  ctx.stroke();
+}
+
+// A bone or rod: dark outline with a lighter core.
+function rod(x1, y1, x2, y2, w, fill) {
+  ctx.lineCap = "round";
+  ctx.strokeStyle = C.metalEdge;
+  ctx.lineWidth = w * 1.4;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  ctx.strokeStyle = fill;
+  ctx.lineWidth = w;
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+
+function teeth(y, h, u) {
+  const count = 8, span = 1.0 * u, w = span / count;
+  ctx.fillStyle = C.tooth;
+  ctx.strokeStyle = C.metalEdge;
+  ctx.lineWidth = u * 0.012;
+  for (let i = 0; i < count; i++) {
+    const x = -span / 2 + i * w;
+    ctx.beginPath();
+    ctx.rect(x + w * 0.06, y, w * 0.88, h);
+    ctx.fill(); ctx.stroke();
+  }
+}
+
+function drawSkull(u, jaw) {
+  // Inside of the mouth
+  ctx.fillStyle = C.socket;
+  ctx.fillRect(-0.56 * u, 0.55 * u, 1.12 * u, 0.5 * u + jaw);
+
+  // Jaw pistons
+  for (const s of [-1, 1]) {
+    rod(s * 0.8 * u, 0.15 * u, s * 0.52 * u, 1.02 * u + jaw, u * 0.07, C.metalLo);
+    rod(s * 0.74 * u, 0.32 * u, s * 0.56 * u, 0.9 * u + jaw, u * 0.03, C.metalHi);
+  }
+
+  teeth(0.56 * u, 0.2 * u, u);
+  teeth(0.72 * u + jaw, 0.18 * u, u);
+
+  // Jaw
+  const jawFill = ctx.createLinearGradient(0, 0.84 * u + jaw, 0, 1.5 * u + jaw);
+  jawFill.addColorStop(0, C.metal);
+  jawFill.addColorStop(1, C.metalLo);
+  ctx.fillStyle = jawFill;
+  ctx.strokeStyle = C.metalEdge;
+  ctx.lineWidth = u * 0.03;
+  ctx.beginPath();
+  ctx.moveTo(-0.62 * u, 0.85 * u + jaw);
+  ctx.lineTo(0.62 * u, 0.85 * u + jaw);
+  ctx.lineTo(0.5 * u, 1.28 * u + jaw);
+  ctx.quadraticCurveTo(0, 1.56 * u + jaw, -0.5 * u, 1.28 * u + jaw);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  bolt(-0.5 * u, 1.0 * u + jaw, u * 0.05);
+  bolt(0.5 * u, 1.0 * u + jaw, u * 0.05);
+
+  // Cranium
+  const plate = ctx.createLinearGradient(0, -1.3 * u, 0, 0.7 * u);
+  plate.addColorStop(0, C.metalHi);
+  plate.addColorStop(0.5, C.metal);
+  plate.addColorStop(1, C.metalLo);
+  ctx.fillStyle = plate;
+  ctx.beginPath();
+  ctx.moveTo(-u, -0.3 * u);
+  ctx.bezierCurveTo(-u, -1.5 * u, u, -1.5 * u, u, -0.3 * u);
+  ctx.bezierCurveTo(u, 0.2 * u, 0.72 * u, 0.25 * u, 0.6 * u, 0.62 * u);
+  ctx.lineTo(-0.6 * u, 0.62 * u);
+  ctx.bezierCurveTo(-0.72 * u, 0.25 * u, -u, 0.2 * u, -u, -0.3 * u);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  // Plate seams
+  ctx.strokeStyle = C.metalEdge;
+  ctx.lineWidth = u * 0.015;
+  ctx.beginPath();
+  ctx.moveTo(0, -1.2 * u); ctx.lineTo(0, -0.62 * u);
+  ctx.moveTo(-0.93 * u, -0.66 * u);
+  ctx.quadraticCurveTo(0, -0.5 * u, 0.93 * u, -0.66 * u);
+  ctx.moveTo(-0.66 * u, 0.42 * u); ctx.lineTo(-0.2 * u, 0.5 * u);
+  ctx.moveTo(0.66 * u, 0.42 * u); ctx.lineTo(0.2 * u, 0.5 * u);
+  ctx.stroke();
+
+  // Nose cavity
+  ctx.fillStyle = C.socket;
+  ctx.beginPath();
+  ctx.moveTo(0, 0.1 * u);
+  ctx.lineTo(0.13 * u, 0.44 * u);
+  ctx.lineTo(0, 0.37 * u);
+  ctx.lineTo(-0.13 * u, 0.44 * u);
+  ctx.closePath();
+  ctx.fill(); ctx.stroke();
+
+  for (const s of [-1, 1]) {
+    bolt(s * 0.62 * u, -0.95 * u, u * 0.045);
+    bolt(s * 0.9 * u, -0.3 * u, u * 0.045);
+    bolt(s * 0.72 * u, 0.2 * u, u * 0.04);
+  }
+  bolt(0, -0.58 * u, u * 0.04);
+}
+
+function drawSocket(cx, cy, u, side) {
+  const R = 0.42 * u;
+  ctx.fillStyle = C.socket;
+  circle(cx, cy, R); ctx.fill();
+  ctx.strokeStyle = C.metalEdge;
+  ctx.lineWidth = u * 0.06;
+  ctx.stroke();
+  ctx.strokeStyle = C.metalHi;
+  ctx.lineWidth = u * 0.018;
+  circle(cx, cy, R + u * 0.015); ctx.stroke();
+
+  // Wiring behind the eyeball
+  const wires = ["#b3262a", "#c9a227", "#2a6fb3"];
+  ctx.lineWidth = u * 0.022;
+  ctx.lineCap = "round";
+  wires.forEach((w, i) => {
+    const a = (side > 0 ? 0 : Math.PI) + (i - 1) * 0.5 + 0.9 * side;
+    ctx.strokeStyle = w;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.quadraticCurveTo(cx + Math.cos(a + 0.5) * R * 0.6, cy + Math.sin(a + 0.5) * R * 0.6, cx + Math.cos(a) * R * 0.95, cy + Math.sin(a) * R * 0.95);
+    ctx.stroke();
+  });
+}
+
+function drawEye(cx, cy, r, side, closed, g) {
   // Eyes turn slightly inward for a close face.
-  const vergence = -side * gaze.near * 0.18;
-  const gx = clamp(gaze.x + vergence, -1, 1);
-  const gy = gaze.y;
-  // Tall, round eyes with an oversized iris read as young and friendly.
-  const rx = r * 0.92, ry = r * 1.06;
-  const reach = r * 0.3;
+  const gx = clamp(g.x - side * gaze.near * 0.16, -1, 1);
+  const gy = g.y;
+  const reach = r * 0.44;
   const len = Math.hypot(gx, gy);
   const scale = len > 1 ? 1 / len : 1;
   const ix = cx + gx * scale * reach;
-  const iy = cy + gy * scale * reach + r * 0.04;
-  const irisR = r * 0.68;
-  // Pupils grow when someone comes close.
-  const pupilR = irisR * (0.52 + gaze.near * 0.16);
+  const iy = cy + gy * scale * reach;
+  // A small iris with white showing all round is what makes a stare unsettling.
+  const irisR = r * 0.44;
+  const pupilR = irisR * (0.3 + gaze.near * 0.34);
 
   ctx.save();
-  ctx.beginPath();
-  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+  circle(cx, cy, r);
   ctx.clip();
 
-  const white = ctx.createRadialGradient(cx, cy - r * 0.2, r * 0.3, cx, cy, ry);
+  const white = ctx.createRadialGradient(cx - r * 0.2, cy - r * 0.25, r * 0.15, cx, cy, r);
   white.addColorStop(0, C.sclera);
   white.addColorStop(1, C.scleraShade);
   ctx.fillStyle = white;
-  ctx.fillRect(cx - r * 1.1, cy - r * 1.1, r * 2.2, r * 2.2);
+  ctx.fillRect(cx - r, cy - r, r * 2, r * 2);
 
-  // Darker at the top, glowing at the bottom.
-  const iris = ctx.createLinearGradient(0, iy - irisR, 0, iy + irisR);
-  iris.addColorStop(0, C.irisDark);
-  iris.addColorStop(0.55, C.iris);
-  iris.addColorStop(1, C.irisGlow);
+  // Veins creeping in from the rim
+  ctx.strokeStyle = C.vein;
+  ctx.lineWidth = Math.max(1, r * 0.018);
+  for (let i = 0; i < 7; i++) {
+    const a = i * 0.9 + side * 0.6;
+    const bend = a + (i % 2 ? 0.35 : -0.3);
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    ctx.quadraticCurveTo(cx + Math.cos(bend) * r * 0.8, cy + Math.sin(bend) * r * 0.8, cx + Math.cos(a) * r * 0.58, cy + Math.sin(a) * r * 0.58);
+    ctx.stroke();
+  }
+
+  const iris = ctx.createRadialGradient(ix, iy, pupilR * 0.6, ix, iy, irisR);
+  iris.addColorStop(0, C.iris);
+  iris.addColorStop(0.8, C.irisDark);
+  iris.addColorStop(1, C.pupil);
   ctx.fillStyle = iris;
-  ctx.beginPath();
-  ctx.arc(ix, iy, irisR, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = C.irisDark;
-  ctx.lineWidth = irisR * 0.09;
-  ctx.stroke();
+  circle(ix, iy, irisR); ctx.fill();
 
   ctx.fillStyle = C.pupil;
-  ctx.beginPath();
-  ctx.arc(ix, iy, pupilR, 0, Math.PI * 2);
-  ctx.fill();
+  circle(ix, iy, pupilR); ctx.fill();
 
-  // Sparkles: one big, one small opposite it, and a soft glint low in the iris.
-  ctx.fillStyle = "rgba(255, 255, 255, .95)";
-  ctx.beginPath();
-  ctx.arc(ix - irisR * 0.36, iy - irisR * 0.4, irisR * 0.27, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.beginPath();
-  ctx.arc(ix + irisR * 0.4, iy + irisR * 0.38, irisR * 0.12, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = "rgba(255, 255, 255, .28)";
-  ctx.beginPath();
-  ctx.ellipse(ix, iy + irisR * 0.7, irisR * 0.42, irisR * 0.14, 0, 0, Math.PI * 2);
-  ctx.fill();
+  ctx.fillStyle = "rgba(255, 255, 255, .8)";
+  circle(ix - irisR * 0.35, iy - irisR * 0.4, irisR * 0.13); ctx.fill();
 
-  // Lids. Wide open at rest; the upper one dips a little when looking down.
-  const rest = clamp(0.03 + gy * 0.06, 0, 0.14);
-  const upper = rest + (1 - rest) * closed * 0.86;
-  const lower = -0.06 + closed * 0.22;
-  const upperY = cy - ry + 2 * ry * upper;
-  const lowerY = cy + ry - 2 * ry * lower;
-  ctx.fillStyle = C.lid;
-  ctx.strokeStyle = C.lidEdge;
-  ctx.lineWidth = Math.max(2, r * 0.035);
-
-  ctx.beginPath();
-  ctx.moveTo(cx - r * 1.1, cy - r * 1.1);
-  ctx.lineTo(cx + r * 1.1, cy - r * 1.1);
-  ctx.lineTo(cx + r * 1.1, upperY - r * 0.12);
-  ctx.quadraticCurveTo(cx, upperY + r * 0.12, cx - r * 1.1, upperY - r * 0.12);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.moveTo(cx - r * 1.1, cy + r * 1.1);
-  ctx.lineTo(cx + r * 1.1, cy + r * 1.1);
-  ctx.lineTo(cx + r * 1.1, lowerY + r * 0.1);
-  ctx.quadraticCurveTo(cx, lowerY - r * 0.1, cx - r * 1.1, lowerY + r * 0.1);
-  ctx.closePath();
-  ctx.fill();
-  ctx.stroke();
-
+  // Metal shutters instead of eyelids. Open all the way at rest.
+  const upper = closed * 0.56;
+  const lower = closed * 0.5;
+  ctx.fillStyle = C.metalLo;
+  ctx.strokeStyle = C.metalEdge;
+  ctx.lineWidth = Math.max(2, r * 0.04);
+  if (closed > 0.01) {
+    ctx.beginPath();
+    ctx.rect(cx - r * 1.1, cy - r * 1.1, r * 2.2, r * 0.1 + 2 * r * upper);
+    ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.rect(cx - r * 1.1, cy + r - 2 * r * lower, r * 2.2, r * 2);
+    ctx.fill(); ctx.stroke();
+  }
   ctx.restore();
 
-  ctx.strokeStyle = C.lidEdge;
+  ctx.strokeStyle = C.metalEdge;
   ctx.lineWidth = Math.max(2, r * 0.05);
-  ctx.beginPath();
-  ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-  ctx.stroke();
+  circle(cx, cy, r); ctx.stroke();
+}
 
-  // Blush on the outer cheek.
-  const bx = cx + side * r * 0.5, by = cy + ry + r * 0.3;
-  const blush = ctx.createRadialGradient(bx, by, 0, bx, by, r * 0.42);
-  blush.addColorStop(0, C.blush);
-  blush.addColorStop(1, "rgba(255, 130, 150, 0)");
-  ctx.fillStyle = blush;
-  ctx.save();
-  ctx.translate(bx, by);
-  ctx.scale(1, 0.55);
+// Binoculars held up in bone hands, used when watching someone far away.
+function drawBinoculars(u, eyeX, eyeY, amount) {
+  const ease = amount * amount * (3 - 2 * amount);
+  const dy = (1 - ease) * (H * 0.75);
+  const R = 0.46 * u, lens = 0.35 * u;
+  const y = eyeY + dy;
+
+  // Forearms rising from below
+  for (const s of [-1, 1]) {
+    const hx = s * (eyeX + R * 1.05), hy = y + R * 0.5;
+    rod(hx, hy, s * 1.45 * u, y + 2.6 * u, u * 0.07, C.bone);
+    rod(hx + s * 0.13 * u, hy + 0.05 * u, s * 1.62 * u, y + 2.6 * u, u * 0.055, C.bone);
+  }
+
+  // Bridge and barrels
+  ctx.fillStyle = C.scope;
+  ctx.strokeStyle = C.scopeHi;
+  ctx.lineWidth = u * 0.02;
   ctx.beginPath();
-  ctx.arc(0, 0, r * 0.42, 0, Math.PI * 2);
-  ctx.restore();
-  ctx.fill();
+  ctx.rect(-0.14 * u, y - 0.12 * u, 0.28 * u, 0.24 * u);
+  ctx.fill(); ctx.stroke();
+  for (const s of [-1, 1]) {
+    const cx = s * eyeX;
+    ctx.strokeStyle = C.scope;
+    ctx.lineWidth = R - lens + u * 0.06;
+    circle(cx, y, (R + lens) / 2 + u * 0.03); ctx.stroke();
+    ctx.strokeStyle = C.scopeHi;
+    ctx.lineWidth = u * 0.02;
+    circle(cx, y, lens); ctx.stroke();
+    circle(cx, y, R + u * 0.06); ctx.stroke();
+    ctx.fillStyle = C.glass;
+    circle(cx, y, lens); ctx.fill();
+    ctx.strokeStyle = "rgba(255, 255, 255, .3)";
+    ctx.lineWidth = u * 0.025;
+    ctx.beginPath();
+    ctx.arc(cx, y, lens * 0.8, Math.PI * 1.1, Math.PI * 1.45);
+    ctx.stroke();
+  }
+
+  // Finger bones wrapped round the outside of each barrel
+  for (const s of [-1, 1]) {
+    const cx = s * eyeX;
+    for (let i = 0; i < 4; i++) {
+      const a = (s > 0 ? 0 : Math.PI) + (i - 1.5) * 0.36 * s;
+      const cos = Math.cos(a), sin = Math.sin(a);
+      const stops = [1.42, 1.17, 0.96, 0.8];
+      for (let j = 0; j < 3; j++) {
+        rod(cx + cos * R * stops[j], y + sin * R * stops[j], cx + cos * R * (stops[j + 1] + 0.05), y + sin * R * (stops[j + 1] + 0.05), u * (0.06 - j * 0.008), C.bone);
+      }
+    }
+  }
 }
 
 function draw(now) {
   ctx.fillStyle = C.ground;
   ctx.fillRect(0, 0, W, H);
-  const r = Math.min(W * 0.2, H * 0.32);
-  const spread = Math.max(W * 0.25, r * 1.15);
+
+  const u = Math.min(W / 2.25, H / 3.25);
   const closed = blinkAmount(now);
-  drawEye(W / 2 - spread, H / 2, r, -1, closed);
-  drawEye(W / 2 + spread, H / 2, r, 1, closed);
+  // The jaw hangs open a little further the closer someone gets.
+  const jaw = (0.03 + gaze.near * 0.26) * u * (1 - scope);
+  const eyeX = 0.45 * u, eyeY = -0.2 * u, r = 0.3 * u;
+
+  ctx.save();
+  // The whole head leans a little toward whoever it is watching.
+  ctx.translate(W / 2 + gaze.x * u * 0.05, H / 2 - 0.12 * u + gaze.y * u * 0.03);
+  drawSkull(u, jaw);
+  drawSocket(-eyeX, eyeY, u, -1);
+  drawSocket(eyeX, eyeY, u, 1);
+  drawEye(-eyeX, eyeY, r, -1, closed, gaze);
+  drawEye(eyeX, eyeY, r, 1, closed, gazeB);
+  if (scope > 0.01) drawBinoculars(u, eyeX, eyeY, scope);
+  ctx.restore();
 }
 
 let previous = performance.now();
